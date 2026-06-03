@@ -1,78 +1,106 @@
 # BRAHMO Composition Agent
 
-Production-style context assembly service for BRAHMO, an AI context system that turns 28 candidate knowledge nodes into a structured, token-safe prompt context.
+A production-grade context composition engine that transforms pre-filtered organizational knowledge nodes into structured, token-safe prompt contexts for AI-assisted clinical decision support.
 
-## What It Does
+Built as the middle layer between a Rules Engine (which selects candidate nodes from an 842-node knowledge graph) and an LLM session, the Composition Agent ensures that every injected context respects strict token budgets while preserving safety-critical constraints.
 
-- Loads 28 candidate nodes from `data/sample_nodes.json`
-- Applies distance-based default compression
-- Protects `CONSTRAINT` nodes from compression
-- Assembles context into fixed 8-block order
-- Enforces a strict token budget across all three sources:
-  - system prompt
-  - rendered context string
-  - user message reserve
-- Iteratively compresses low `injection_weight` nodes until the final rendered prompt fits
-- Fails safely when the budget cannot be met without compressing constraints
+## Key Features
+
+- **Token Budget Enforcement** — Three-source budget accounting (system prompt + rendered context + user reserve) with iterative compression to guarantee the final output never exceeds the ceiling.
+- **Constraint Protection** — `CONSTRAINT`-type nodes are never compressed or omitted, regardless of budget pressure. Safety-critical information is always preserved at full fidelity.
+- **8-Block Structured Context** — Nodes are routed into a fixed-priority block order (Role → Global Constraints → Decisions → Active Constraints → Session Context → Open Questions → Stale Flags → Boundaries) for deterministic, predictable prompt assembly.
+- **Distance-Weighted Compression** — Initial compression levels are assigned based on graph distance from the session entry point, with four degradation tiers: `FULL → COMPRESSED → CONSTRAINT_ONLY → OMIT`.
+- **Iterative Compression Loop** — When over-budget, the engine compresses the lowest `injection_weight` non-constraint node one tier at a time, recalculating after each step to avoid over-compression.
+- **Safe Failure** — If constraints alone exceed the budget, the system returns a structured error (HTTP 422) instead of silently truncating critical information.
+- **Full Observability** — Every composition returns per-node decision traces, compression logs, block-level token breakdowns, and a safety status flag.
 
 ## Architecture
 
-```text
-main.py               FastAPI app and strict /compose endpoint
-token_counter.py      tiktoken counting utilities
-importance_scorer.py  importance score metadata
-compressor.py         distance defaults and compression transitions
-budget_fitter.py      initial iterative budget fitting
-block_assembler.py    fixed 8-block routing
-context_builder.py    final rendered context string
-data/sample_nodes.json 28 hospital-domain candidate nodes
-frontend/             Next.js demo UI
-tests/                backend safety tests
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     POST /compose                               │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Load 28 candidate nodes from data source                    │
+│  2. Estimate token counts per compression variant (tiktoken)    │
+│  3. Assign distance-based compression levels                    │
+│  4. Compute importance scores (type × weight × distance decay)  │
+│  5. Route nodes into 8 structural blocks                        │
+│  6. Enforce token budget via iterative compression              │
+│  7. Render final context string with block headers              │
+│  8. Verify rendered total ≤ budget (post-render guarantee)      │
+│  9. Return context + full composition metadata                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Project Structure
+
+```
+├── main.py                  FastAPI application and /compose endpoint
+├── token_counter.py         tiktoken-based token counting (cl100k_base)
+├── importance_scorer.py     Dual-weight importance scoring per node
+├── compressor.py            Compression level assignment and transitions
+├── budget_fitter.py         Iterative budget enforcement engine
+├── block_assembler.py       8-block structural routing
+├── context_builder.py       Final context string renderer
+├── data/
+│   └── sample_nodes.json    28 hospital-domain candidate nodes
+├── tests/
+│   └── test_compose.py      Backend composition safety tests
+├── docs/
+│   └── architecture.md      Detailed architecture documentation
+├── frontend/                Next.js dashboard for composition visualization
+│   ├── src/app/             App layout and main page
+│   ├── src/components/      UI components (BudgetBar, NodeCard, CompressionLog, etc.)
+│   └── src/lib/             API client
+└── requirements.txt         Python dependencies
 ```
 
 ## Token Safety Guarantee
 
-The final guarantee is based on the rendered context string, not only on node estimates.
+The system enforces a strict post-render token guarantee:
 
-```text
-total = system_prompt_tokens + tiktoken(context_string) + user_reserve_tokens
+```
+total = system_prompt_tokens + tiktoken(rendered_context_string) + user_reserve_tokens
 ```
 
-If `total > budget`, the system compresses the lowest `injection_weight` non-constraint node one step:
+This is verified against the **actual rendered output**, not pre-render estimates. If `total > budget`, the engine iteratively compresses the lowest-priority non-constraint node through the degradation chain:
 
-```text
-FULL -> COMPRESSED -> CONSTRAINT_ONLY -> OMIT
+```
+FULL → COMPRESSED → CONSTRAINT_ONLY → OMIT
 ```
 
-If all non-constraint nodes are omitted and the total still exceeds budget, `/compose` returns HTTP `422`.
+If all non-constraint nodes are exhausted and the budget still cannot be met, the endpoint returns HTTP `422` with a structured error — it never silently drops constraints.
 
-## Block Order
+## Context Block Order
 
-The final context is rendered in this order:
+| Block | Name | Content |
+|-------|------|---------|
+| 1 | Role | Dynamic user + organization + patient frame |
+| 2 | Global Constraints | `CONSTRAINT` nodes with `zone=2` — always `FULL` |
+| 3 | Recent Decisions | `DECISION` nodes, sorted by relevance |
+| 4 | Active Constraints | `CONSTRAINT` nodes with `zone=1` — always `FULL` |
+| 5 | Session Context | `FACT`, `ANTI_PATTERN`, and remaining nodes |
+| 6 | Open Questions | Reserved for future use |
+| 7 | Stale Flags | `REVIEW_REQUIRED` nodes — block omitted if empty |
+| 8 | Session Boundaries | Static `CAPTURE:` instruction for knowledge graph feedback |
 
-1. ROLE
-2. GLOBAL CONSTRAINTS
-3. RECENT DECISIONS
-4. ACTIVE CONSTRAINTS
-5. SESSION CONTEXT
-6. OPEN QUESTIONS
-7. STALE FLAGS, only when `REVIEW_REQUIRED` nodes exist
-8. SESSION BOUNDARIES, including `CAPTURE:`
+## Getting Started
 
-## Run Backend
+### Prerequisites
+
+- Python 3.10+
+- Node.js 18+ (for the frontend dashboard)
+
+### Backend
 
 ```bash
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Open:
+The API documentation is available at `http://localhost:8000/docs`.
 
-```text
-http://localhost:8000/docs
-```
-
-## Run Frontend
+### Frontend Dashboard
 
 ```bash
 cd frontend
@@ -80,71 +108,74 @@ npm install
 npm run dev
 ```
 
-Open:
+The dashboard is available at `http://localhost:3000`.
 
-```text
-http://localhost:3000
-```
-
-## API Examples
-
-Default budget:
+### Run Tests
 
 ```bash
-curl -X POST http://localhost:8000/compose \
-  -H "Content-Type: application/json" \
-  -d '{"budget":4000,"user_id":"U-VIKRAM","patient_id":"PAT-RAJAN"}'
+python -m pytest tests/ -v
 ```
 
-Tight budget:
+## API Reference
 
-```bash
-curl -X POST http://localhost:8000/compose \
-  -H "Content-Type: application/json" \
-  -d '{"budget":1500}'
+### `POST /compose`
+
+Composes a token-budget-safe context string from candidate nodes.
+
+**Request Body:**
+
+```json
+{
+  "budget": 4000,
+  "user_id": "U-VIKRAM",
+  "patient_id": "PAT-RAJAN"
+}
 ```
 
-Impossible budget:
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `budget` | `int` | `4000` | Maximum total token ceiling |
+| `user_id` | `string` | `U-VIKRAM` | User profile identifier |
+| `patient_id` | `string` | `PAT-RAJAN` | Patient profile identifier |
+| `data_file` | `string` | `null` | Optional path to a custom node data file |
 
-```bash
-curl -X POST http://localhost:8000/compose \
-  -H "Content-Type: application/json" \
-  -d '{"budget":700}'
-```
+**Response Fields:**
 
-Expected behavior:
+| Field | Description |
+|-------|-------------|
+| `context_string` | The final rendered context string, ready for LLM injection |
+| `token_stats` | Breakdown of system, context, and reserve token usage |
+| `block_breakdown` | Per-block node count and token usage |
+| `node_details` | Per-node metadata including compression decisions and decision traces |
+| `compression_log` | Pass-by-pass record of every compression action taken |
+| `compression_summary` | Count of nodes at each compression level |
+| `safety_status` | `FIT` (no compression needed) or `COMPRESSED_TO_FIT` |
+| `constraints_protected` | Number of constraint nodes preserved at `FULL` |
 
-- `4000`: fits safely
-- `1500`: compresses and fits
-- `700`: returns `422`, because constraints cannot safely fit
+### `GET /users`
 
-## Response Highlights
+Returns the list of available user profiles.
 
-`POST /compose` returns:
+### `GET /patients`
 
-- `context_string`
-- `token_stats`
-- `block_breakdown`
-- `node_details`
-- `decision_trace` per node
-- `compression_log`
-- `compression_summary`
-- `safety_status`
+Returns the list of available patient profiles.
 
-## Run Tests
+## Design Decisions
 
-```bash
-python -m unittest discover -s tests
-```
+- **tiktoken over heuristic counting** — Character-count-based estimation (chars ÷ 4) introduces ±30–40% error. We use OpenAI's `cl100k_base` tokenizer for exact counts.
+- **Pre-generated compression variants** — Each node stores three content variants (`content_full`, `content_compressed`, `content_constraint_only`) at creation time. This makes composition deterministic and fast with zero LLM calls at runtime.
+- **Iterative over batch compression** — Compressing one node per iteration (lowest `injection_weight` first) avoids over-compression and preserves maximum information within the budget.
+- **Post-render verification** — Token counts are verified on the final rendered string, not on per-node estimates, eliminating drift from block headers, formatting, and separators.
 
-## Demo Talking Points
+## Tech Stack
 
-1. Show the 4000-token successful composition.
-2. Show token breakdown: system + context + user reserve.
-3. Show fixed 8-block context order.
-4. Lower budget to 1500 and show iterative compression.
-5. Open compression log and explain each pass.
-6. Open a node card and show retrieval weight, injection weight, distance, and decision trace.
-7. Show constraints remain `FULL`.
-8. Lower budget to 700 and show safe failure instead of unsafe constraint compression.
+| Layer | Technology |
+|-------|------------|
+| Backend | Python, FastAPI, Pydantic |
+| Tokenization | tiktoken (`cl100k_base`) |
+| Frontend | Next.js, React, TypeScript, Tailwind CSS |
+| Testing | pytest, unittest |
 
+## License
+
+This project is part of the BRAHMO organizational AI platform.
